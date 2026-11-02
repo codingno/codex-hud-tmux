@@ -1,0 +1,604 @@
+#!/usr/bin/env python3
+"""codex-hud: show Codex rate-limit / token usage in tmux.
+
+Reads the newest Codex session rollout (~/.codex/sessions/**/rollout-*.jsonl),
+extracts the last `token_count` event and renders either a compact status
+string (tmux format) or a detailed ANSI view for `display-popup`.
+
+Commands:
+    codex-hud status [--plain] [--refresh]   compact status-line text
+    codex-hud detail [--wait]                multi-line ANSI view
+    codex-hud color                          green|yellow|red|gray
+    codex-hud json                           raw snapshot (debug)
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import select
+import subprocess
+import sys
+import termios
+import tempfile
+import time
+import tty
+from datetime import datetime
+
+DEFAULTS = {
+    "interval": "30",
+    "stale": "600",
+    "warn": "50",
+    "crit": "20",
+    "bar-width": "20",
+}
+
+SESSION_RE = re.compile(
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+)
+TAIL_BYTES = 256 * 1024
+MAX_CANDIDATES = 25
+
+ANSI = {
+    "green": "32",
+    "yellow": "33",
+    "red": "31",
+    "dim": "2",
+    "bold": "1",
+}
+
+
+# --------------------------------------------------------------------------- #
+# config
+# --------------------------------------------------------------------------- #
+def get_opt(name: str, default: str) -> str:
+    # Environment only: status commands must never call back into tmux while
+    # the server is evaluating a #() job (that deadlocks tmux).
+    env_key = "CODEX_HUD_" + name.upper().replace("-", "_")
+    return os.environ.get(env_key) or default
+
+
+def get_int(name: str) -> int:
+    try:
+        return int(get_opt(name, DEFAULTS[name]))
+    except (TypeError, ValueError):
+        return int(DEFAULTS[name])
+
+
+# --------------------------------------------------------------------------- #
+# data discovery
+# --------------------------------------------------------------------------- #
+def codex_home() -> str:
+    return os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+
+
+def find_sessions(root: str) -> list[tuple[float, str]]:
+    sessions_dir = os.path.join(root, "sessions")
+    found: list[tuple[float, str]] = []
+    if not os.path.isdir(sessions_dir):
+        return found
+    for dirpath, _dirnames, filenames in os.walk(sessions_dir):
+        for filename in filenames:
+            if filename.startswith("rollout-") and filename.endswith(".jsonl"):
+                path = os.path.join(dirpath, filename)
+                try:
+                    found.append((os.path.getmtime(path), path))
+                except OSError:
+                    continue
+    found.sort()
+    return found
+
+
+def read_tail(path: str, max_bytes: int = TAIL_BYTES) -> list[str]:
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            start = max(0, size - max_bytes)
+            handle.seek(start)
+            data = handle.read()
+    except OSError:
+        return []
+    lines = data.decode("utf-8", "replace").splitlines()
+    if start > 0 and lines:
+        lines = lines[1:]
+    return lines
+
+
+def last_token_count(path: str) -> dict | None:
+    for line in reversed(read_tail(path)):
+        if '"token_count"' not in line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        payload = obj.get("payload")
+        if isinstance(payload, dict) and payload.get("type") == "token_count":
+            return obj
+    return None
+
+
+def parse_window(raw) -> dict | None:
+    if not isinstance(raw, dict):
+        return None
+    used = raw.get("used_percent")
+    if used is None:
+        return None
+    try:
+        used = float(used)
+    except (TypeError, ValueError):
+        return None
+    resets_at = raw.get("resets_at")
+    if isinstance(resets_at, (int, float)) and resets_at > 1e12:
+        resets_at = resets_at / 1000.0
+    return {
+        "used": used,
+        "remaining": max(0.0, 100.0 - used),
+        "window_minutes": raw.get("window_minutes"),
+        "resets_at": resets_at,
+    }
+
+
+def build_snapshot(path: str, mtime: float, event: dict) -> dict:
+    payload = event.get("payload") or {}
+    info = payload.get("info") or {}
+    limits = payload.get("rate_limits") or {}
+    total = info.get("total_token_usage") or {}
+    last = info.get("last_token_usage") or {}
+    match = SESSION_RE.search(os.path.basename(path))
+    return {
+        "ok": True,
+        "session": path,
+        "session_id": match.group(1) if match else None,
+        "mtime": mtime,
+        "age": max(0.0, time.time() - mtime),
+        "event_time": event.get("timestamp"),
+        "plan": limits.get("plan_type"),
+        "credits": limits.get("credits"),
+        "primary": parse_window(limits.get("primary")),
+        "secondary": parse_window(limits.get("secondary")),
+        "total_tokens": total.get("total_tokens"),
+        "last_tokens": last.get("total_tokens"),
+        "context_window": info.get("model_context_window"),
+    }
+
+
+def _live_window(raw) -> dict | None:
+    if not isinstance(raw, dict) or raw.get("usedPercent") is None:
+        return None
+    return parse_window(
+        {
+            "used_percent": raw.get("usedPercent"),
+            "window_minutes": raw.get("windowDurationMins"),
+            "resets_at": raw.get("resetsAt"),
+        }
+    )
+
+
+def live_rate_limits(timeout: float = 8.0) -> dict | None:
+    """Ask a short-lived `codex app-server` for the account's current limits.
+
+    Rollout files only change when a session processes a turn, so they go
+    stale. The app-server `account/rateLimits/read` call is always current.
+    """
+    try:
+        proc = subprocess.Popen(
+            ["codex", "app-server"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except (OSError, ValueError):
+        return None
+    result = None
+    try:
+        for msg in (
+            {"id": 1, "method": "initialize",
+             "params": {"clientInfo": {"name": "codex-hud", "version": "1"}}},
+            {"method": "initialized"},
+            {"id": 2, "method": "account/rateLimits/read"},
+        ):
+            proc.stdin.write(json.dumps(msg) + "\n")
+        proc.stdin.flush()
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            ready, _, _ = select.select([proc.stdout], [], [], 0.5)
+            if not ready:
+                continue
+            line = proc.stdout.readline()
+            if not line:
+                break
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("id") == 2:
+                result = (obj.get("result") or {}).get("rateLimits")
+                break
+    except (OSError, ValueError):
+        result = None
+    finally:
+        try:
+            proc.kill()
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+    if not isinstance(result, dict):
+        return None
+    primary = _live_window(result.get("primary"))
+    secondary = _live_window(result.get("secondary"))
+    if not primary and not secondary:
+        return None
+    credits = result.get("credits") or {}
+    return {
+        "plan": result.get("planType"),
+        "credits": {
+            "has_credits": credits.get("hasCredits"),
+            "unlimited": credits.get("unlimited"),
+            "balance": credits.get("balance"),
+        },
+        "primary": primary,
+        "secondary": secondary,
+    }
+
+
+def rollout_snapshot() -> dict:
+    root = codex_home()
+    sessions = find_sessions(root)
+    if not sessions:
+        return {"ok": False, "reason": "no-session"}
+    for mtime, path in reversed(sessions[-MAX_CANDIDATES:]):
+        event = last_token_count(path)
+        if event is not None:
+            return build_snapshot(path, mtime, event)
+    return {"ok": False, "reason": "no-usage"}
+
+
+def snapshot() -> dict:
+    snap = rollout_snapshot()
+    live = live_rate_limits()
+    if live is None:
+        return snap
+    if not snap.get("ok") or snap["age"] > get_int("stale"):
+        # Session data is old: keep only the live account-level numbers.
+        snap = {"ok": True, "session": None, "session_id": None}
+    snap.update(live)
+    snap["mtime"] = time.time()
+    snap["age"] = 0.0
+    snap["live"] = True
+    return snap
+
+
+def thread_name(root: str, session_id: str | None) -> str | None:
+    if not session_id:
+        return None
+    index = os.path.join(root, "session_index.jsonl")
+    if not os.path.exists(index):
+        return None
+    name = None
+    try:
+        with open(index, "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if session_id not in line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("id") == session_id and obj.get("thread_name"):
+                    name = obj["thread_name"]
+    except OSError:
+        return None
+    return name
+
+
+# --------------------------------------------------------------------------- #
+# formatting helpers
+# --------------------------------------------------------------------------- #
+def fmt_pct(value: float) -> str:
+    if value >= 99.95:
+        return "100"
+    if value <= 0.05:
+        return "0"
+    return f"{value:.0f}"
+
+
+def fmt_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return ""
+    seconds = int(seconds)
+    if seconds <= 0:
+        return "now"
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    if days:
+        return f"{days}d{hours:02d}h"
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    return f"{minutes}m"
+
+
+def fmt_reset_clock(ts: float | None) -> str:
+    if not ts:
+        return ""
+    try:
+        when = datetime.fromtimestamp(ts)
+    except (OverflowError, OSError, ValueError):
+        return ""
+    if ts - time.time() > 86400:
+        return when.strftime("%b %d %H:%M")
+    return when.strftime("%H:%M")
+
+
+def fmt_tokens(value) -> str:
+    if value is None:
+        return "?"
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return "?"
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if value >= 1000:
+        return f"{value / 1000:.1f}k"
+    return str(value)
+
+
+def color_for(remaining: float, warn: int, crit: int) -> str:
+    if remaining <= crit:
+        return "red"
+    if remaining <= warn:
+        return "yellow"
+    return "green"
+
+
+def paint(text: str, *styles: str) -> str:
+    prefix = "".join(f"\033[{ANSI[style]}m" for style in styles if style in ANSI)
+    return f"{prefix}{text}\033[0m"
+
+
+def make_bar(remaining: float, width: int, color: str) -> str:
+    width = max(4, width)
+    filled = int(round(width * remaining / 100.0))
+    filled = min(width, max(0, filled))
+    return paint("█" * filled, color) + paint("░" * (width - filled), "dim")
+
+
+# --------------------------------------------------------------------------- #
+# renderers
+# --------------------------------------------------------------------------- #
+def render_status(snap: dict, styled: bool = True) -> str:
+    idle = "#[dim]codex: idle#[default]" if styled else "codex idle"
+
+    if not snap.get("ok"):
+        if snap.get("reason") == "no-usage":
+            return "#[dim]codex: no usage#[default]" if styled else "codex no usage"
+        return idle
+
+    warn = get_int("warn")
+    crit = get_int("crit")
+    stale_after = get_int("stale")
+    stale = snap["age"] > stale_after
+    attrs = ",dim" if stale else ""
+    now = time.time()
+
+    segments = []
+    for label, window in (("5h", snap.get("primary")), ("wk", snap.get("secondary"))):
+        if not window:
+            continue
+        if window.get("resets_at") and window["resets_at"] <= now:
+            continue
+        remaining = window["remaining"]
+        color = color_for(remaining, warn, crit)
+        text = f"{label} {fmt_pct(remaining)}%"
+        if window.get("resets_at"):
+            text += f" ↻{fmt_reset_clock(window['resets_at'])}"
+        segments.append(f"#[fg={color}{attrs}]{text}" if styled else text)
+
+    if not segments:
+        if snap.get("total_tokens") and not snap.get("primary") and not snap.get("secondary"):
+            tokens = fmt_tokens(snap.get("total_tokens"))
+            return f"#[dim]codex {tokens} tok" if styled else f"codex {tokens} tok"
+        return idle
+
+    if styled:
+        return "#[default] " + " │ ".join(segments) + "#[default]"
+    return " │ ".join(segments)
+
+
+def overall_level(snap: dict) -> str:
+    if not snap.get("ok"):
+        return "gray"
+    warn = get_int("warn")
+    crit = get_int("crit")
+    now = time.time()
+    levels = []
+    for window in (snap.get("primary"), snap.get("secondary")):
+        if not window:
+            continue
+        if window.get("resets_at") and window["resets_at"] <= now:
+            continue
+        levels.append(color_for(window["remaining"], warn, crit))
+    if not levels:
+        return "gray"
+    if "red" in levels:
+        return "red"
+    if "yellow" in levels:
+        return "yellow"
+    return "green"
+
+
+def render_detail(snap: dict) -> str:
+    root = codex_home()
+    width = 56
+    out: list[str] = []
+
+    if not snap.get("ok"):
+        out.append(paint("Codex HUD", "bold"))
+        out.append("─" * width)
+        out.append("")
+        if snap.get("reason") == "no-usage":
+            out.append(paint("No token usage found in recent sessions.", "yellow"))
+        else:
+            out.append(paint("No Codex session found.", "yellow"))
+        out.append("")
+        out.append(f"Searched: {os.path.join(root, 'sessions')}")
+        out.append("Start a Codex session and usage will appear here.")
+        return "\n".join(out) + "\n"
+
+    warn = get_int("warn")
+    crit = get_int("crit")
+    bar_width = get_int("bar-width")
+    stale_after = get_int("stale")
+    stale = snap["age"] > stale_after
+
+    out.append(paint("Codex usage", "bold"))
+    out.append("─" * width)
+
+    for label, window in (("5-hour window", snap.get("primary")), ("Weekly window", snap.get("secondary"))):
+        if not window:
+            continue
+        remaining = window["remaining"]
+        color = color_for(remaining, warn, crit)
+        pct = f"{fmt_pct(remaining)}% left"
+        out.append("")
+        out.append(f"{label:<{width - len(pct)}}{paint(pct, color, 'bold')}")
+        reset = ""
+        if window.get("resets_at"):
+            delta = window["resets_at"] - time.time()
+            if delta > 0:
+                clock = fmt_reset_clock(window["resets_at"])
+                reset = f"  resets in {fmt_duration(delta)}"
+                if clock:
+                    reset += f" ({clock})"
+            else:
+                reset = "  window reset (stale snapshot)" if stale else "  window reset"
+        out.append(make_bar(remaining, bar_width, color) + reset)
+
+    if not snap.get("primary") and not snap.get("secondary"):
+        out.append("")
+        out.append(paint("Rate limits not reported by this session.", "yellow"))
+        out.append(f"Tokens: total {fmt_tokens(snap.get('total_tokens'))}")
+
+    out.append("")
+    meta = []
+    if snap.get("plan"):
+        meta.append(f"plan {snap['plan']}")
+    credits = snap.get("credits") or {}
+    if credits.get("has_credits") and credits.get("balance"):
+        meta.append(f"credits {credits['balance']}")
+    elif credits:
+        meta.append("credits none")
+    if meta:
+        out.append(" · ".join(meta))
+
+    name = thread_name(root, snap.get("session_id"))
+    if name:
+        out.append(f'Thread "{name}"')
+
+    if snap.get("last_tokens") and snap.get("context_window"):
+        pct = snap["last_tokens"] / snap["context_window"] * 100
+        out.append(
+            f"Context {fmt_tokens(snap['last_tokens'])} / "
+            f"{fmt_tokens(snap['context_window'])} ({pct:.0f}%)"
+        )
+
+    age = snap["age"]
+    updated = "Live from Codex account" if snap.get("live") else f"Updated {fmt_duration(age)} ago"
+    out.append(paint(updated, "dim") if age > stale_after else updated)
+
+    return "\n".join(out) + "\n"
+
+
+# --------------------------------------------------------------------------- #
+# cache
+# --------------------------------------------------------------------------- #
+def cache_dir() -> str:
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    path = os.path.join(tempfile.gettempdir(), f"codex-hud-{uid}")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def atomic_write(path: str, text: str) -> None:
+    directory = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def status_path() -> str:
+    return os.path.join(cache_dir(), "status.txt")
+
+
+def cmd_status(force: bool, plain: bool = False) -> None:
+    interval = get_int("interval")
+    path = status_path()
+    suffix = ".plain" if plain else ""
+    cached = path + suffix
+    if not force and interval > 0:
+        try:
+            if time.time() - os.path.getmtime(cached) < interval:
+                with open(cached, "r", encoding="utf-8") as handle:
+                    sys.stdout.write(handle.read())
+                return
+        except OSError:
+            pass
+    text = render_status(snapshot(), styled=not plain)
+    try:
+        atomic_write(cached, text)
+    except OSError:
+        pass
+    sys.stdout.write(text)
+
+
+def cmd_detail(wait: bool = False) -> None:
+    snap = snapshot()
+    sys.stdout.write(render_detail(snap))
+    if wait and sys.stdin.isatty():
+        sys.stdout.write("\n" + paint("Press any key to close", "dim") + "\n")
+        sys.stdout.flush()
+    try:
+        atomic_write(status_path(), render_status(snap))
+    except OSError:
+        pass
+    if wait and sys.stdin.isatty():
+        fd = sys.stdin.fileno()
+        previous = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            os.read(fd, 1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, previous)
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    command = args[0] if args else "status"
+    if command == "status":
+        cmd_status("--refresh" in args, plain="--plain" in args)
+    elif command == "detail":
+        cmd_detail("--wait" in args)
+    elif command == "color":
+        sys.stdout.write(overall_level(snapshot()))
+    elif command == "json":
+        print(json.dumps(snapshot(), indent=2))
+    else:
+        sys.exit(
+            "usage: codex-hud [status [--plain] [--refresh] | detail | color | json]"
+        )
+
+
+if __name__ == "__main__":
+    main()

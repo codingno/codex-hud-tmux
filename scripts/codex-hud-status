@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Fast status entry point: reads the cached string with zero Python startup on
+# hits and only invokes the Python core when the cache is stale.
+#
+# Usage: codex-hud-status [styled|plain]
+set -u
+
+CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MODE="${1:-styled}"
+case "$MODE" in
+  plain) SUFFIX=".plain"; ARG="--plain" ;;
+  *) MODE="styled"; SUFFIX=""; ARG="" ;;
+esac
+
+UID_NUM="$(id -u)"
+STATE_DIR="${TMPDIR:-/tmp}/codex-hud-${UID_NUM}"
+CACHE="$STATE_DIR/status.txt${SUFFIX}"
+
+INTERVAL="${CODEX_HUD_INTERVAL:-30}"
+case "$INTERVAL" in
+  '' | *[!0-9]*) INTERVAL=30 ;;
+esac
+
+if [ -f "$CACHE" ]; then
+  if mtime=$(stat -f %m "$CACHE" 2>/dev/null) || mtime=$(stat -c %Y "$CACHE" 2>/dev/null); then
+    now=$(date +%s)
+    if [ $((now - mtime)) -lt "$INTERVAL" ]; then
+      cat "$CACHE"
+      exit 0
+    fi
+  fi
+fi
+
+exec python3 "$CURRENT_DIR/codex-hud" status $ARG --refresh

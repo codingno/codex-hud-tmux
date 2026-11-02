@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+UID_NUM="$(id -u)"
+STATE_DIR="${TMPDIR:-/tmp}/codex-hud-${UID_NUM}"
+mkdir -p "$STATE_DIR"
+PID_FILE="$STATE_DIR/poll.pid"
+
+if [ -f "$PID_FILE" ]; then
+  old_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+    exit 0
+  fi
+fi
+printf '%s' "$$" >"$PID_FILE"
+
+cleanup() { rm -f "$PID_FILE"; }
+trap cleanup EXIT
+
+interval=30
+value="$(tmux show-option -gqv @codex-hud-interval 2>/dev/null || true)"
+case "$value" in
+  '' | *[!0-9]*) ;;
+  *) interval="$value" ;;
+esac
+[ "$interval" -lt 5 ] && interval=5
+
+"$CURRENT_DIR/codex-hud" status --refresh >/dev/null 2>&1 || true
+
+while sleep "$interval"; do
+  "$CURRENT_DIR/codex-hud" status --refresh >/dev/null 2>&1 || true
+done
